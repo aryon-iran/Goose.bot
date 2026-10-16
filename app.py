@@ -1,10 +1,9 @@
 import os
 import time
 import random
+import sqlite3
 import threading
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from flask import Flask
 
 # ================== تنظیمات ==================
@@ -13,24 +12,21 @@ API_URL = f"https://tapi.bale.ai/bot{TOKEN}"
 ADMIN_USERNAME = "aryon_admin"
 RUN_COMMAND = "Run_goose_dark"
 MENU_COMMAND = "dark_goose"
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DB_PATH = os.environ.get("DB_PATH", "goose.db")
 
 # ================== وضعیت ==================
 bot_active = False
 last_update_id = 0
 admin_state = {}
 
-# ================== اتصال به دیتابیس ==================
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
-
+# ================== دیتابیس ==================
 def init_db():
-    conn = get_conn()
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS groups (
-        chat_id BIGINT PRIMARY KEY, title TEXT, joined_at BIGINT)""")
+        chat_id INTEGER PRIMARY KEY, title TEXT, joined_at INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT, chat_id BIGINT,
+        user_id INTEGER, chat_id INTEGER,
         username TEXT, first_name TEXT,
         goose_calls INTEGER DEFAULT 0,
         gif_count INTEGER DEFAULT 0,
@@ -40,207 +36,199 @@ def init_db():
         birthday TEXT,
         PRIMARY KEY (user_id, chat_id))""")
     c.execute("""CREATE TABLE IF NOT EXISTS exams (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT, subject TEXT, exam_date TEXT)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER, subject TEXT, exam_date TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS homeworks (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT, subject TEXT, description TEXT)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER, subject TEXT, description TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS achievements (
-        user_id BIGINT, chat_id BIGINT, title TEXT,
-        awarded_at BIGINT, PRIMARY KEY (user_id, chat_id, title))""")
-    c.execute("""CREATE TABLE IF NOT EXISTS blocked (user_id BIGINT PRIMARY KEY)""")
+        user_id INTEGER, chat_id INTEGER, title TEXT,
+        awarded_at INTEGER, PRIMARY KEY (user_id, chat_id, title))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS blocked (user_id INTEGER PRIMARY KEY)""")
     c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS shop (
-        id SERIAL PRIMARY KEY,
-        chat_id BIGINT, item_name TEXT, price INTEGER, description TEXT)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER, item_name TEXT, price INTEGER, description TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS purchases (
-        user_id BIGINT, chat_id BIGINT, item_name TEXT,
-        bought_at BIGINT, PRIMARY KEY (user_id, chat_id, item_name))""")
+        user_id INTEGER, chat_id INTEGER, item_name TEXT,
+        bought_at INTEGER, PRIMARY KEY (user_id, chat_id, item_name))""")
     c.execute("""CREATE TABLE IF NOT EXISTS game_sessions (
-        chat_id BIGINT PRIMARY KEY, game_type TEXT, state TEXT, started_at BIGINT)""")
+        chat_id INTEGER PRIMARY KEY, game_type TEXT, state TEXT, started_at INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS keywords (
-        id SERIAL PRIMARY KEY,
-        keyword TEXT UNIQUE, reply_text TEXT, created_at BIGINT)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        keyword TEXT UNIQUE, reply_text TEXT, created_at INTEGER)""")
     conn.commit()
-    c.close()
     conn.close()
 
-# ================== توابع دیتابیس ==================
+def db():
+    return sqlite3.connect(DB_PATH)
+
+# ================== تنظیمات ==================
 def get_setting(key, default=None):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key=%s", (key,))
-    row = c.fetchone(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = c.fetchone(); conn.close()
     return row[0] if row else default
 
 def set_setting(key, value):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("""INSERT INTO settings (key, value) VALUES (%s, %s)
-                 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
-              (key, str(value)))
-    conn.commit(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, str(value)))
+    conn.commit(); conn.close()
 
+# ================== کاربر ==================
 def ensure_user(user_id, chat_id, username, first_name):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("""INSERT INTO users (user_id, chat_id, username, first_name)
-                 VALUES (%s, %s, %s, %s)
-                 ON CONFLICT (user_id, chat_id) DO UPDATE
-                 SET username=EXCLUDED.username, first_name=EXCLUDED.first_name""",
-              (user_id, chat_id, username, first_name))
-    conn.commit(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("""INSERT OR IGNORE INTO users (user_id, chat_id, username, first_name)
+                 VALUES (?, ?, ?, ?)""", (user_id, chat_id, username, first_name))
+    c.execute("UPDATE users SET username=?, first_name=? WHERE user_id=? AND chat_id=?",
+              (username, first_name, user_id, chat_id))
+    conn.commit(); conn.close()
 
 def ensure_group(chat_id, title):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("""INSERT INTO groups (chat_id, title, joined_at)
-                 VALUES (%s, %s, %s)
-                 ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title""",
-              (chat_id, title, int(time.time())))
-    conn.commit(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("""INSERT OR IGNORE INTO groups (chat_id, title, joined_at)
+                 VALUES (?, ?, ?)""", (chat_id, title, int(time.time())))
+    c.execute("UPDATE groups SET title=? WHERE chat_id=?", (title, chat_id))
+    conn.commit(); conn.close()
 
 def inc_field(user_id, chat_id, field, amount=1):
     allowed = {"goose_calls", "gif_count", "sticker_count", "msg_count"}
     if field not in allowed:
         return
-    conn = get_conn(); c = conn.cursor()
-    c.execute(f"UPDATE users SET {field}={field}+%s WHERE user_id=%s AND chat_id=%s",
+    conn = db(); c = conn.cursor()
+    c.execute(f"UPDATE users SET {field}={field}+? WHERE user_id=? AND chat_id=?",
               (amount, user_id, chat_id))
-    conn.commit(); c.close(); conn.close()
+    conn.commit(); conn.close()
 
 def get_user(user_id, chat_id):
-    conn = get_conn(); c = conn.cursor(cursor_factory=RealDictCursor)
-    c.execute("SELECT * FROM users WHERE user_id=%s AND chat_id=%s", (user_id, chat_id))
-    row = c.fetchone(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id=? AND chat_id=?", (user_id, chat_id))
+    row = c.fetchone(); conn.close()
     return row
 
 def get_coins(user_id, chat_id):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT coins FROM users WHERE user_id=%s AND chat_id=%s", (user_id, chat_id))
-    row = c.fetchone(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT coins FROM users WHERE user_id=? AND chat_id=?", (user_id, chat_id))
+    row = c.fetchone(); conn.close()
     return row[0] if row else 0
 
 def add_coins(user_id, chat_id, amount):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("UPDATE users SET coins=coins+%s WHERE user_id=%s AND chat_id=%s",
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE users SET coins=coins+? WHERE user_id=? AND chat_id=?",
               (amount, user_id, chat_id))
-    conn.commit(); c.close(); conn.close()
+    conn.commit(); conn.close()
 
 def is_blocked(user_id):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT 1 FROM blocked WHERE user_id=%s", (user_id,))
-    r = c.fetchone(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT 1 FROM blocked WHERE user_id=?", (user_id,))
+    r = c.fetchone(); conn.close()
     return r is not None
 
+# ================== دستاورد ==================
 def award_achievement(user_id, chat_id, title):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("""INSERT INTO achievements (user_id, chat_id, title, awarded_at)
-                 VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+    conn = db(); c = conn.cursor()
+    c.execute("""INSERT OR IGNORE INTO achievements VALUES (?, ?, ?, ?)""",
               (user_id, chat_id, title, int(time.time())))
     inserted = c.rowcount > 0
-    conn.commit(); c.close(); conn.close()
+    conn.commit(); conn.close()
     return inserted
 
 def get_achievements(user_id, chat_id):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT title FROM achievements WHERE user_id=%s AND chat_id=%s",
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT title FROM achievements WHERE user_id=? AND chat_id=?",
               (user_id, chat_id))
-    rows = c.fetchall(); c.close(); conn.close()
+    rows = c.fetchall(); conn.close()
     return [r[0] for r in rows]
 
 def all_groups():
-    conn = get_conn(); c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT chat_id, title FROM groups")
-    rows = c.fetchall(); c.close(); conn.close()
+    rows = c.fetchall(); conn.close()
     return rows
 
+# ================== فروشگاه ==================
 def get_shop(chat_id):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT item_name, price, description FROM shop WHERE chat_id=%s", (chat_id,))
-    rows = c.fetchall(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT item_name, price, description FROM shop WHERE chat_id=?", (chat_id,))
+    rows = c.fetchall(); conn.close()
     return rows
 
 def add_shop_item(chat_id, name, price, desc):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("INSERT INTO shop (chat_id, item_name, price, description) VALUES (%s, %s, %s, %s)",
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO shop (chat_id, item_name, price, description) VALUES (?, ?, ?, ?)",
               (chat_id, name, price, desc))
-    conn.commit(); c.close(); conn.close()
+    conn.commit(); conn.close()
 
 def del_shop_item(chat_id, name):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM shop WHERE chat_id=%s AND item_name=%s", (chat_id, name))
-    n = c.rowcount; conn.commit(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM shop WHERE chat_id=? AND item_name=?", (chat_id, name))
+    n = c.rowcount; conn.commit(); conn.close()
     return n
 
 def buy_item(user_id, chat_id, item_name):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT price FROM shop WHERE chat_id=%s AND item_name=%s",
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT price FROM shop WHERE chat_id=? AND item_name=?",
               (chat_id, item_name))
     row = c.fetchone()
     if not row:
-        c.close(); conn.close(); return "not_found"
+        conn.close(); return "not_found"
     price = row[0]
-    c.execute("SELECT coins FROM users WHERE user_id=%s AND chat_id=%s", (user_id, chat_id))
+    c.execute("SELECT coins FROM users WHERE user_id=? AND chat_id=?", (user_id, chat_id))
     u = c.fetchone()
     if not u or u[0] < price:
-        c.close(); conn.close(); return "no_money"
-    c.execute("UPDATE users SET coins=coins-%s WHERE user_id=%s AND chat_id=%s",
+        conn.close(); return "no_money"
+    c.execute("UPDATE users SET coins=coins-? WHERE user_id=? AND chat_id=?",
               (price, user_id, chat_id))
-    c.execute("""INSERT INTO purchases (user_id, chat_id, item_name, bought_at)
-                 VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+    c.execute("INSERT OR IGNORE INTO purchases VALUES (?, ?, ?, ?)",
               (user_id, chat_id, item_name, int(time.time())))
-    conn.commit(); c.close(); conn.close()
+    conn.commit(); conn.close()
     return "ok"
 
 def get_purchases(user_id, chat_id):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT item_name FROM purchases WHERE user_id=%s AND chat_id=%s",
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT item_name FROM purchases WHERE user_id=? AND chat_id=?",
               (user_id, chat_id))
-    rows = c.fetchall(); c.close(); conn.close()
+    rows = c.fetchall(); conn.close()
     return [r[0] for r in rows]
 
-# ================== کلیدواژه‌ها ==================
+# ================== کلیدواژه ==================
 def add_keyword(keyword, reply_text):
     keyword = keyword.strip()
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT id FROM keywords WHERE keyword=%s", (keyword,))
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id FROM keywords WHERE keyword=?", (keyword,))
     exists = c.fetchone()
     if exists:
-        c.execute("UPDATE keywords SET reply_text=%s WHERE keyword=%s",
+        c.execute("UPDATE keywords SET reply_text=? WHERE keyword=?",
                   (reply_text, keyword))
-        conn.commit(); c.close(); conn.close()
+        conn.commit(); conn.close()
         return "updated"
     else:
         c.execute("""INSERT INTO keywords (keyword, reply_text, created_at)
-                     VALUES (%s, %s, %s)""",
-                  (keyword, reply_text, int(time.time())))
-        conn.commit(); c.close(); conn.close()
+                     VALUES (?, ?, ?)""", (keyword, reply_text, int(time.time())))
+        conn.commit(); conn.close()
         return "added"
 
 def del_keyword(keyword):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("DELETE FROM keywords WHERE keyword=%s", (keyword.strip(),))
-    n = c.rowcount; conn.commit(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM keywords WHERE keyword=?", (keyword.strip(),))
+    n = c.rowcount; conn.commit(); conn.close()
     return n
 
 def list_keywords():
-    conn = get_conn(); c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT keyword, reply_text FROM keywords ORDER BY id")
-    rows = c.fetchall(); c.close(); conn.close()
+    rows = c.fetchall(); conn.close()
     return rows
 
 def find_keyword(text):
-    conn = get_conn(); c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT keyword, reply_text FROM keywords")
-    rows = c.fetchall(); c.close(); conn.close()
+    rows = c.fetchall(); conn.close()
     low = text.lower()
     for kw, reply in rows:
         if kw.lower() in low:
             return reply
     return None
-
-def get_keyword_by_exact(keyword):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT reply_text FROM keywords WHERE keyword=%s", (keyword.strip(),))
-    row = c.fetchone(); c.close(); conn.close()
-    return row[0] if row else None
 
 # ================== دستاوردها ==================
 ACHIEVEMENTS = [
@@ -259,11 +247,11 @@ def check_achievements(user_id, chat_id):
     if not u:
         return []
     values = {
-        "goose_calls": u.get("goose_calls", 0),
-        "gif_count": u.get("gif_count", 0),
-        "sticker_count": u.get("sticker_count", 0),
-        "msg_count": u.get("msg_count", 0),
-        "coins": u.get("coins", 0),
+        "goose_calls": u[4] if len(u) > 4 else 0,
+        "gif_count": u[5] if len(u) > 5 else 0,
+        "sticker_count": u[6] if len(u) > 6 else 0,
+        "msg_count": u[7] if len(u) > 7 else 0,
+        "coins": u[8] if len(u) > 8 else 0,
     }
     new = []
     for field, threshold, title in ACHIEVEMENTS:
@@ -366,6 +354,7 @@ def get_admin_menu():
     return {"inline_keyboard": [
         [{"text": "📊 آمار", "callback_data": "adm_stats"},
          {"text": "📝 گروه‌ها", "callback_data": "adm_groups"}],
+        [{"text": "📚 متن‌های آماده", "callback_data": "adm_quick_menu"}],
         [{"text": "🎓 افزودن امتحان", "callback_data": "adm_add_exam"},
          {"text": "📚 افزودن تکلیف", "callback_data": "adm_add_hw"}],
         [{"text": "🗑 حذف امتحان", "callback_data": "adm_del_exam"},
@@ -411,6 +400,122 @@ def get_game_menu():
         [{"text": "🧩 چیستان", "callback_data": "game_riddle"}],
     ]}
 
+# ================== پیام همگانی ==================
+def show_group_selector(chat_id):
+    groups = all_groups()
+    if not groups:
+        send_message(chat_id,
+            "❌ هنوز هیچ گروهی ثبت نشده.\n\n"
+            "اول Goose رو توی گروه‌ها پیام بفرست تا خودکار ثبت شن.")
+        return
+    kb = {"inline_keyboard": []}
+    kb["inline_keyboard"].append([{"text": f"🌍 همه گروه‌ها ({len(groups)} تا)", "callback_data": "bc_target_all"}])
+    for cid, title in groups:
+        short = (title[:35] if title else str(cid))
+        kb["inline_keyboard"].append([
+            {"text": f"📝 {short}", "callback_data": f"bc_target_{cid}"}
+        ])
+    kb["inline_keyboard"].append([{"text": "🔙 بازگشت", "callback_data": "adm_back"}])
+    send_message(chat_id, f"🎯 *کجا بفرستم؟*\nتعداد گروه‌ها: {len(groups)}", kb, parse_mode="Markdown")
+
+def show_broadcast_type(chat_id, target):
+    target_name = "🌍 همه گروه‌ها"
+    if target != "all":
+        for cid, title in all_groups():
+            if str(cid) == str(target):
+                target_name = f"📝 {title}"
+                break
+    kb = {"inline_keyboard": [
+        [{"text": "✏️ متن", "callback_data": f"bc_type_text|{target}"},
+         {"text": "🖼 عکس + متن", "callback_data": f"bc_type_photo|{target}"}],
+        [{"text": "↩️ ریپلای روی پیام", "callback_data": f"bc_type_reply|{target}"}],
+        [{"text": "🔙 بازگشت", "callback_data": "adm_broadcast"}],
+    ]}
+    send_message(chat_id,
+        f"🎯 مقصد: *{target_name}*\n\n📤 چه نوع پیامی بفرستم؟",
+        kb, parse_mode="Markdown")
+
+def show_broadcast_confirm(chat_id, target, btype, preview):
+    target_name = "🌍 همه گروه‌ها"
+    if target != "all":
+        for cid, title in all_groups():
+            if str(cid) == str(target):
+                target_name = f"📝 {title}"
+                break
+    type_names = {"text": "✏️ متن", "photo": "🖼 عکس + متن", "reply": "↩️ ریپلای"}
+    short = preview[:300] + ("..." if len(preview) > 300 else "")
+    kb = {"inline_keyboard": [
+        [{"text": "✅ تایید و ارسال", "callback_data": "bc_confirm_send"}],
+        [{"text": "✏️ ویرایش", "callback_data": "adm_broadcast"},
+         {"text": "❌ لغو", "callback_data": "adm_back"}],
+    ]}
+    send_message(chat_id,
+        f"📋 *تایید نهایی*\n\n"
+        f"📍 مقصد: {target_name}\n"
+        f"📝 نوع: {type_names.get(btype, btype)}\n"
+        f"📄 محتوا:\n«{short}»\n\n"
+        f"تایید می‌کنی؟",
+        kb, parse_mode="Markdown")
+
+def do_broadcast(chat_id, target, btype, data):
+    if target == "all":
+        group_ids = [c[0] for c in all_groups()]
+    else:
+        group_ids = [int(target)]
+    
+    sent = 0
+    failed = 0
+    failed_list = []
+    
+    for gid in group_ids:
+        ok = False
+        if btype == "text":
+            res = send_message(gid, data.get("text", ""))
+            ok = bool(res and res.get("ok"))
+        elif btype == "photo":
+            res = send_photo(gid, data.get("file_id"), data.get("caption", ""))
+            ok = bool(res and res.get("ok"))
+        elif btype == "reply":
+            ok = copy_message(gid, chat_id, data.get("msg_id"))
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+            failed_list.append(gid)
+    
+    msg = (f"📊 *گزارش ارسال پیام همگانی*\n\n"
+           f"✅ موفق: {sent}\n"
+           f"❌ ناموفق: {failed}\n"
+           f"📦 مجموع: {sent + failed}")
+    if failed_list:
+        msg += f"\n\n⚠️ گروه‌های ناموفق: {', '.join(map(str, failed_list[:5]))}"
+        if len(failed_list) > 5:
+            msg += f" و {len(failed_list)-5} تای دیگه"
+    send_message(chat_id, msg, parse_mode="Markdown")
+
+# ================== متن‌های آماده ==================
+def show_quick_menu(chat_id):
+    exam_txt = get_setting("quick_exam")
+    hw_txt = get_setting("quick_hw")
+    exam_status = f"✅ تعریف شده ({len(exam_txt)} کاراکتر)" if exam_txt else "❌ تعریف نشده"
+    hw_status = f"✅ تعریف شده ({len(hw_txt)} کاراکتر)" if hw_txt else "❌ تعریف نشده"
+    
+    kb = {"inline_keyboard": [
+        [{"text": f"📝 آزمون — {exam_status}", "callback_data": "adm_quick_set_exam"}],
+        [{"text": f"📝 تکلیف — {hw_status}", "callback_data": "adm_quick_set_hw"}],
+        [{"text": "👁 پیش‌نمایش آزمون", "callback_data": "adm_quick_preview_exam"},
+         {"text": "👁 پیش‌نمایش تکلیف", "callback_data": "adm_quick_preview_hw"}],
+        [{"text": "🔙 بازگشت", "callback_data": "adm_back"}],
+    ]}
+    info = (
+        "📚 *متن‌های آماده*\n\n"
+        "این متن‌ها وقتی فرستاده می‌شن که کسی توی گروه بپرسه:\n\n"
+        "🎓 *آزمون:* «آزمون چیه»، «امتحان چی داریم»، «امتحان داریم»، ...\n"
+        "📚 *تکلیف:* «تکلیف چیه»، «تکلیف چی داریم»، «تکالیف چیه»، ...\n\n"
+        "⬇️ یکی رو انتخاب کن:"
+    )
+    send_message(chat_id, info, kb, parse_mode="Markdown")
+
 # ================== چیستان ==================
 RIDDLES = [
     ("چیست که هر چه از آن بگیری بزرگ‌تر می‌شود؟", "چاله"),
@@ -428,22 +533,25 @@ RIDDLES = [
 # ================== راهنما ==================
 def send_help(chat_id):
     text = (
-        "🪿 راهنمای کامل Goose v4.0\n\n"
-        "🎮 سرگرمی:\n"
+        "🪿 *راهنمای کامل Goose v6.2*\n\n"
+        "🎓 *سوالات درسی:*\n"
+        "• «آزمون چیه؟» یا «امتحان چی داریم؟»\n"
+        "• «تکلیف چیه؟» یا «تکلیف چی داریم؟»\n\n"
+        "🎮 *سرگرمی:*\n"
         "• dark_goose — منوی کامل\n"
         "• Goose یا گوس — 💰 ۱ سکه\n"
         "• Goose بازی — بازی گروهی\n\n"
-        "💰 اقتصاد:\n"
+        "💰 *اقتصاد:*\n"
         "• /balance — موجودی سکه\n"
         "• /shop — فروشگاه\n"
         "• /buy اسم — خرید\n"
         "• /inv — خریدهای من\n\n"
-        "🏆 دستاوردها:\n"
+        "🏆 *دستاوردها:*\n"
         "• Goose دستاوردها\n\n"
-        "📞 ادمین: /admin توی PV\n"
+        "📞 *ادمین:* /admin توی PV\n"
         "• /help_gose — همین راهنما"
     )
-    send_message(chat_id, text)
+    send_message(chat_id, text, parse_mode="Markdown")
 
 # ================== PV ادمین ==================
 def handle_admin_pv(message):
@@ -453,6 +561,52 @@ def handle_admin_pv(message):
     reply_to = message.get("reply_to_message")
     state = admin_state.get(chat_id)
 
+    # ===== متن‌های آماده =====
+    if state and state.get("type") == "quickreply_wait":
+        key = state["key"]
+        label = state.get("label", key)
+        set_setting(key, text)
+        send_message(chat_id, f"✅ متن «{label}» ذخیره شد.\n\n"
+                              f"حالا هرکسی توی گروه بپرسه، Goose این متن رو می‌فرسته.")
+        admin_state.pop(chat_id, None)
+        return
+
+    # ===== پیام همگانی - مرحله محتوا =====
+    if state and state.get("type") == "broadcast_wait":
+        target = state["target"]
+        btype = state["btype"]
+        data_dict = {}
+        preview = ""
+        
+        if btype == "text":
+            if not text:
+                send_message(chat_id, "❌ باید متن بفرستی.")
+                return
+            data_dict = {"text": text}
+            preview = text
+        elif btype == "photo":
+            if not photo:
+                send_message(chat_id, "❌ باید عکس بفرستی.")
+                return
+            data_dict = {"file_id": photo[-1]["file_id"], "caption": message.get("caption") or ""}
+            preview = f"[🖼 عکس] {data_dict['caption'] or 'بدون کپشن'}"
+        elif btype == "reply":
+            if not reply_to:
+                send_message(chat_id, "❌ باید روی یه پیام ریپلای کنی و بفرستی.")
+                return
+            data_dict = {"msg_id": reply_to["message_id"]}
+            preview = f"[↩️ ریپلای روی پیام {data_dict['msg_id']}]"
+        
+        admin_state[chat_id] = {
+            "type": "broadcast_confirm",
+            "target": target,
+            "btype": btype,
+            "data": data_dict,
+        }
+        show_broadcast_confirm(chat_id, target, btype, preview)
+        return
+
+    # ===== state های دیگه =====
     if state:
         t = state.get("type")
         target = state.get("chat_id") or (all_groups()[0][0] if all_groups() else None)
@@ -462,10 +616,10 @@ def handle_admin_pv(message):
             if len(parts) != 2:
                 send_message(chat_id, "❌ فرمت: موضوع — تاریخ")
                 return
-            conn = get_conn(); c = conn.cursor()
-            c.execute("INSERT INTO exams (chat_id, subject, exam_date) VALUES (%s, %s, %s)",
+            conn = db(); c = conn.cursor()
+            c.execute("INSERT INTO exams (chat_id, subject, exam_date) VALUES (?, ?, ?)",
                       (target, parts[0].strip(), parts[1].strip()))
-            conn.commit(); c.close(); conn.close()
+            conn.commit(); conn.close()
             send_message(chat_id, "✅ امتحان اضافه شد.")
             admin_state.pop(chat_id, None)
 
@@ -474,26 +628,26 @@ def handle_admin_pv(message):
             if len(parts) != 2:
                 send_message(chat_id, "❌ فرمت: موضوع — توضیح")
                 return
-            conn = get_conn(); c = conn.cursor()
-            c.execute("INSERT INTO homeworks (chat_id, subject, description) VALUES (%s, %s, %s)",
+            conn = db(); c = conn.cursor()
+            c.execute("INSERT INTO homeworks (chat_id, subject, description) VALUES (?, ?, ?)",
                       (target, parts[0].strip(), parts[1].strip()))
-            conn.commit(); c.close(); conn.close()
+            conn.commit(); conn.close()
             send_message(chat_id, "✅ تکلیف اضافه شد.")
             admin_state.pop(chat_id, None)
 
         elif t == "del_exam":
-            conn = get_conn(); c = conn.cursor()
-            c.execute("DELETE FROM exams WHERE chat_id=%s AND subject=%s",
+            conn = db(); c = conn.cursor()
+            c.execute("DELETE FROM exams WHERE chat_id=? AND subject=?",
                       (target, text.strip()))
-            n = c.rowcount; conn.commit(); c.close(); conn.close()
+            n = c.rowcount; conn.commit(); conn.close()
             send_message(chat_id, f"🗑 {n} حذف شد.")
             admin_state.pop(chat_id, None)
 
         elif t == "del_hw":
-            conn = get_conn(); c = conn.cursor()
-            c.execute("DELETE FROM homeworks WHERE chat_id=%s AND subject=%s",
+            conn = db(); c = conn.cursor()
+            c.execute("DELETE FROM homeworks WHERE chat_id=? AND subject=?",
                       (target, text.strip()))
-            n = c.rowcount; conn.commit(); c.close(); conn.close()
+            n = c.rowcount; conn.commit(); conn.close()
             send_message(chat_id, f"🗑 {n} حذف شد.")
             admin_state.pop(chat_id, None)
 
@@ -501,9 +655,7 @@ def handle_admin_pv(message):
             state["keyword"] = text
             state["type"] = "kw_add_reply"
             send_message(chat_id,
-                f"✅ کلیدواژه: «{text}»\n\n"
-                f"حالا متن کامل جواب رو بفرست.\n"
-                f"می‌تونی از ایموجی و خط جدید استفاده کنی.")
+                f"✅ کلیدواژه: «{text}»\n\nحالا متن کامل جواب رو بفرست.")
             return
 
         elif t == "kw_add_reply":
@@ -551,34 +703,16 @@ def handle_admin_pv(message):
             except:
                 send_message(chat_id, "❌ آیدی عددی")
                 return
-            conn = get_conn(); c = conn.cursor()
-            c.execute("UPDATE users SET birthday=%s WHERE user_id=%s",
+            conn = db(); c = conn.cursor()
+            c.execute("UPDATE users SET birthday=? WHERE user_id=?",
                       (parts[1].strip(), uid))
-            conn.commit(); c.close(); conn.close()
+            conn.commit(); conn.close()
             send_message(chat_id, "✅ تولد ثبت شد.")
             admin_state.pop(chat_id, None)
 
         elif t == "welcome":
             set_setting("welcome_text", text)
             send_message(chat_id, "✅ ذخیره شد.")
-            admin_state.pop(chat_id, None)
-
-        elif t == "broadcast":
-            groups = all_groups()
-            sent = 0
-            if photo:
-                caption = message.get("caption") or ""
-                file_id = photo[-1]["file_id"]
-                for g, _ in groups:
-                    if send_photo(g, file_id, caption): sent += 1
-            elif reply_to:
-                mid = reply_to["message_id"]
-                for g, _ in groups:
-                    if copy_message(g, chat_id, mid): sent += 1
-            else:
-                for g, _ in groups:
-                    if send_message(g, text): sent += 1
-            send_message(chat_id, f"✅ به {sent} گروه ارسال شد.")
             admin_state.pop(chat_id, None)
 
         elif t == "give_coin":
@@ -591,9 +725,9 @@ def handle_admin_pv(message):
             except:
                 send_message(chat_id, "❌ اعداد درست بفرست")
                 return
-            conn = get_conn(); c = conn.cursor()
-            c.execute("UPDATE users SET coins=coins+%s WHERE user_id=%s", (amount, uid))
-            conn.commit(); c.close(); conn.close()
+            conn = db(); c = conn.cursor()
+            c.execute("UPDATE users SET coins=coins+? WHERE user_id=?", (amount, uid))
+            conn.commit(); conn.close()
             send_message(chat_id, f"✅ {amount} سکه داده شد.")
             admin_state.pop(chat_id, None)
 
@@ -602,9 +736,9 @@ def handle_admin_pv(message):
                 uid = int(text.strip())
             except:
                 send_message(chat_id, "❌ آیدی عددی"); return
-            conn = get_conn(); c = conn.cursor()
-            c.execute("INSERT INTO blocked (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (uid,))
-            conn.commit(); c.close(); conn.close()
+            conn = db(); c = conn.cursor()
+            c.execute("INSERT OR IGNORE INTO blocked VALUES (?)", (uid,))
+            conn.commit(); conn.close()
             send_message(chat_id, "🚫 بلاک شد.")
             admin_state.pop(chat_id, None)
 
@@ -613,15 +747,15 @@ def handle_admin_pv(message):
                 uid = int(text.strip())
             except:
                 send_message(chat_id, "❌ آیدی عددی"); return
-            conn = get_conn(); c = conn.cursor()
-            c.execute("DELETE FROM blocked WHERE user_id=%s", (uid,))
-            conn.commit(); c.close(); conn.close()
+            conn = db(); c = conn.cursor()
+            c.execute("DELETE FROM blocked WHERE user_id=?", (uid,))
+            conn.commit(); conn.close()
             send_message(chat_id, "✅ رفع بلاک شد.")
             admin_state.pop(chat_id, None)
         return
 
     if text in ("/admin", "admin", "پنل"):
-        send_message(chat_id, "🪿 پنل ادمین:", get_admin_menu())
+        send_message(chat_id, "🪿 پنل ادمین v6.2:", get_admin_menu())
         return
     if text == "/help_gose":
         send_help(chat_id)
@@ -674,24 +808,77 @@ def handle_callback(cb):
         send_message(chat_id, f"🪙 {r}\n💰 +1 سکه")
     elif data == "game_guess":
         target = random.randint(1, 100)
-        conn = get_conn(); c = conn.cursor()
-        c.execute("""INSERT INTO game_sessions (chat_id, game_type, state, started_at)
-                     VALUES (%s, %s, %s, %s)
-                     ON CONFLICT (chat_id) DO UPDATE SET game_type=EXCLUDED.game_type,
-                     state=EXCLUDED.state, started_at=EXCLUDED.started_at""",
+        conn = db(); c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO game_sessions VALUES (?, ?, ?, ?)",
                   (chat_id, "guess", str(target), int(time.time())))
-        conn.commit(); c.close(); conn.close()
+        conn.commit(); conn.close()
         send_message(chat_id, "🔢 یه عدد ۱ تا ۱۰۰ انتخاب کردم! اولین درست = ۱۰ سکه")
     elif data == "game_riddle":
         riddle, answer = random.choice(RIDDLES)
-        conn = get_conn(); c = conn.cursor()
-        c.execute("""INSERT INTO game_sessions (chat_id, game_type, state, started_at)
-                     VALUES (%s, %s, %s, %s)
-                     ON CONFLICT (chat_id) DO UPDATE SET game_type=EXCLUDED.game_type,
-                     state=EXCLUDED.state, started_at=EXCLUDED.started_at""",
+        conn = db(); c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO game_sessions VALUES (?, ?, ?, ?)",
                   (chat_id, "riddle", answer, int(time.time())))
-        conn.commit(); c.close(); conn.close()
+        conn.commit(); conn.close()
         send_message(chat_id, f"🧩 {riddle}\n\nاولین جواب درست: ۱۰ سکه!")
+
+    # ===== متن‌های آماده =====
+    elif data == "adm_quick_menu" and is_admin and is_pv:
+        show_quick_menu(chat_id)
+    elif data == "adm_quick_set_exam" and is_admin and is_pv:
+        admin_state[chat_id] = {"type": "quickreply_wait", "key": "quick_exam", "label": "آزمون"}
+        send_message(chat_id,
+            "📝 *متن کامل آزمون* رو بفرست.\n\n"
+            "می‌تونی از ایموجی، ستاره *بولد*، و خط جدید استفاده کنی.\n\n"
+            "⚠️ این متن هر بار که کسی توی گروه بپرسه «آزمون چیه» یا "
+            "«امتحان چی داریم» فرستاده می‌شه.",
+            parse_mode="Markdown")
+    elif data == "adm_quick_set_hw" and is_admin and is_pv:
+        admin_state[chat_id] = {"type": "quickreply_wait", "key": "quick_hw", "label": "تکلیف"}
+        send_message(chat_id,
+            "📝 *متن کامل تکلیف* رو بفرست.\n\n"
+            "⚠️ این متن هر بار که کسی توی گروه بپرسه «تکلیف چیه» یا "
+            "«تکلیف چی داریم» فرستاده می‌شه.",
+            parse_mode="Markdown")
+    elif data == "adm_quick_preview_exam" and is_admin and is_pv:
+        txt = get_setting("quick_exam")
+        if txt:
+            send_message(chat_id, f"👁 *پیش‌نمایش آزمون:*\n\n{txt}", parse_mode="Markdown")
+        else:
+            send_message(chat_id, "❌ هنوز آزمون تعریف نشده.")
+    elif data == "adm_quick_preview_hw" and is_admin and is_pv:
+        txt = get_setting("quick_hw")
+        if txt:
+            send_message(chat_id, f"👁 *پیش‌نمایش تکلیف:*\n\n{txt}", parse_mode="Markdown")
+        else:
+            send_message(chat_id, "❌ هنوز تکلیف تعریف نشده.")
+
+    # ===== پیام همگانی =====
+    elif data == "adm_broadcast" and is_admin and is_pv:
+        show_group_selector(chat_id)
+    elif data.startswith("bc_target_") and is_admin and is_pv:
+        target = data.replace("bc_target_", "")
+        admin_state[chat_id] = {"type": "broadcast", "target": target}
+        show_broadcast_type(chat_id, target)
+    elif data.startswith("bc_type_") and is_admin and is_pv:
+        rest = data.replace("bc_type_", "")
+        if "|" in rest:
+            btype, target = rest.split("|", 1)
+        else:
+            btype, target = "text", "all"
+        admin_state[chat_id] = {"type": "broadcast_wait", "target": target, "btype": btype}
+        prompts = {
+            "text": "📝 متن پیام رو بفرست:",
+            "photo": "🖼 عکس رو با کپشن (اختیاری) بفرست:",
+            "reply": "↩️ روی پیامی که می‌خوای forward بشه ریپلای کن و بفرست:",
+        }
+        send_message(chat_id, prompts.get(btype, "بفرست:"))
+    elif data == "bc_confirm_send" and is_admin and is_pv:
+        st = admin_state.get(chat_id, {})
+        if st.get("type") != "broadcast_confirm":
+            send_message(chat_id, "❌ چیزی برای ارسال نیست.")
+        else:
+            do_broadcast(chat_id, st["target"], st["btype"], st["data"])
+            admin_state.pop(chat_id, None)
 
     # پنل ادمین
     elif data.startswith("adm_") and is_admin and is_pv:
@@ -708,14 +895,25 @@ def handle_admin_cb(data, chat_id, user):
     target = all_groups()[0][0] if all_groups() else None
     if data == "adm_back": send_message(chat_id, "🪿 پنل:", get_admin_menu())
     elif data == "adm_stats":
-        conn = get_conn(); c = conn.cursor()
+        conn = db(); c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM groups"); g = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM users"); u = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM exams"); e = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM homeworks"); h = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM keywords"); k = c.fetchone()[0]
-        c.close(); conn.close()
-        send_message(chat_id, f"📊 گروه:{g} | کاربر:{u} | امتحان:{e} | تکلیف:{h} | کلیدواژه:{k}")
+        conn.close()
+        exam_txt = get_setting("quick_exam")
+        hw_txt = get_setting("quick_hw")
+        send_message(chat_id,
+            f"📊 *آمار Goose v6.2*\n\n"
+            f"👥 گروه‌ها: {g}\n"
+            f"👤 کاربران: {u}\n"
+            f"🎓 امتحان‌ها: {e}\n"
+            f"📚 تکالیف: {h}\n"
+            f"🔑 کلیدواژه‌ها: {k}\n"
+            f"📝 متن آزمون: {'✅' if exam_txt else '❌'}\n"
+            f"📝 متن تکلیف: {'✅' if hw_txt else '❌'}",
+            parse_mode="Markdown")
     elif data == "adm_groups":
         gs = all_groups()
         send_message(chat_id, "\n".join([f"• {t} ({cc})" for cc, t in gs]) if gs else "هیچ گروهی نیست.")
@@ -734,17 +932,14 @@ def handle_admin_cb(data, chat_id, user):
     elif data == "adm_list_exam": send_exam_list(chat_id)
     elif data == "adm_list_hw": send_hw_list(chat_id)
 
-    # ======== کلیدواژه‌ها ========
     elif data == "adm_kw_menu":
         send_message(chat_id, "🔑 مدیریت کلیدواژه‌ها:", get_kw_menu())
     elif data == "adm_kw_add":
         admin_state[chat_id] = {"type": "kw_add_keyword"}
-        send_message(chat_id,
-            "🔑 کلیدواژه رو بفرست (کلمه‌ای که Goose وقتی شنید جواب بده).\n"
-            "مثال: امتحان چی داریم")
+        send_message(chat_id, "🔑 کلیدواژه رو بفرست:\nمثال: امتحان چی داریم")
     elif data == "adm_kw_del":
         admin_state[chat_id] = {"type": "kw_del"}
-        send_message(chat_id, "🗑 کلیدواژه‌ای که می‌خوای حذف شه رو بفرست:")
+        send_message(chat_id, "🗑 کلیدواژه‌ای که می‌خوای حذف شه:")
     elif data == "adm_kw_list":
         kws = list_keywords()
         if not kws:
@@ -768,9 +963,6 @@ def handle_admin_cb(data, chat_id, user):
     elif data == "adm_welcome":
         admin_state[chat_id] = {"type": "welcome"}
         send_message(chat_id, "👋 متن خوش‌آمدگویی:")
-    elif data == "adm_broadcast":
-        admin_state[chat_id] = {"type": "broadcast"}
-        send_message(chat_id, "📢 متن/عکس/ریپلای:")
     elif data == "adm_mood":
         send_message(chat_id, f"🎭 حالت فعلی: {current_mood()}", get_mood_menu())
     elif data == "adm_give_coin":
@@ -788,18 +980,18 @@ def handle_admin_cb(data, chat_id, user):
         send_message(chat_id, f"{'🟢 فعال' if bot_active else '🔴 خاموش'}")
 
 def send_exam_list(chat_id):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT subject, exam_date FROM exams WHERE chat_id=%s", (chat_id,))
-    rows = c.fetchall(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT subject, exam_date FROM exams WHERE chat_id=?", (chat_id,))
+    rows = c.fetchall(); conn.close()
     if not rows:
         send_message(chat_id, "🎓 امتحانی ثبت نشده.")
     else:
         send_message(chat_id, "🎓 امتحان‌ها:\n" + "\n".join([f"• {s} → {d}" for s, d in rows]))
 
 def send_hw_list(chat_id):
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT subject, description FROM homeworks WHERE chat_id=%s", (chat_id,))
-    rows = c.fetchall(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT subject, description FROM homeworks WHERE chat_id=?", (chat_id,))
+    rows = c.fetchall(); conn.close()
     if not rows:
         send_message(chat_id, "📚 تکلیفی ثبت نشده.")
     else:
@@ -820,7 +1012,6 @@ def handle_message(message):
 
     print(f"[msg] {chat_type} @{username}: {text[:50]}")
 
-    # خوش‌آمدگویی
     if chat_type in ("group", "supergroup") and message.get("new_chat_members"):
         ensure_group(chat_id, chat.get("title") or "")
         welcome = get_setting("welcome_text", "🎉 خوش اومدی به گروه!")
@@ -829,7 +1020,6 @@ def handle_message(message):
             send_message(chat_id, f"👋 {m.get('first_name','')} عزیز، {welcome}")
         return
 
-    # PV ادمین
     if chat_type == "private":
         if is_admin: handle_admin_pv(message)
         else: send_message(chat_id, "🪿 فقط توی گروه‌ها کار می‌کنم.")
@@ -838,17 +1028,15 @@ def handle_message(message):
     if chat_type in ("group", "supergroup"):
         ensure_group(chat_id, chat.get("title") or "")
 
-    # فعال‌سازی
     if text == RUN_COMMAND:
         if not is_admin: return
         bot_active = True
-        send_message(chat_id, "🪿 Goose فعال شد! v4.0")
+        send_message(chat_id, "🪿 Goose فعال شد! v6.2")
         return
 
     if not bot_active: return
     if uid and is_blocked(uid): return
 
-    # ثبت کاربر
     if uid:
         ensure_user(uid, chat_id, username, first_name)
         inc_field(uid, chat_id, "msg_count")
@@ -857,22 +1045,47 @@ def handle_message(message):
         for t in check_achievements(uid, chat_id):
             send_message(chat_id, f"🏆 {first_name} دستاورد گرفت: {t}")
 
-    # کلیدواژه‌های ادمین (اولویت بالا)
+    # ===== کلیدواژه‌های ادمین =====
     if text and not text.startswith("/"):
         kw_reply = find_keyword(text)
         if kw_reply:
-            send_message(chat_id, kw_reply)
+            send_message(chat_id, kw_reply, parse_mode="Markdown")
             return
 
-    # راهنما
+    # ===== سوالات رایج — آزمون =====
+    exam_keywords = [
+        "آزمون چیه", "آزمون چیست", "آزمون چی داریم",
+        "امتحان چیه", "امتحان چیست", "امتحان چی داریم",
+        "امتحان داریم", "آزمون داریم",
+        "ازمون چیه", "ازمون چی داریم", "ازمون چیست",
+        "بودجه آزمون", "بودجه امتحان",
+    ]
+    if any(k in text for k in exam_keywords):
+        txt = get_setting("quick_exam")
+        if txt:
+            send_message(chat_id, txt, parse_mode="Markdown")
+            return
+
+    # ===== سوالات رایج — تکلیف =====
+    hw_keywords = [
+        "تکلیف چیه", "تکلیف چیست", "تکلیف چی داریم",
+        "تکالیف چیه", "تکالیف چیست", "تکالیف چی داریم",
+        "تکلیف داریم", "وظیفه چیه",
+        "مشق چیه", "مشق چی داریم",
+    ]
+    if any(k in text for k in hw_keywords):
+        txt = get_setting("quick_hw")
+        if txt:
+            send_message(chat_id, txt, parse_mode="Markdown")
+            return
+
+    # ===== راهنما =====
     if text == "/help_gose":
         send_help(chat_id); return
 
-    # موجودی
     if text == "/balance":
         send_message(chat_id, f"💰 {first_name}: {get_coins(uid, chat_id)} سکه"); return
 
-    # فروشگاه
     if text == "/shop":
         items = get_shop(chat_id)
         if not items: send_message(chat_id, "🛒 فروشگاه خالیه.")
@@ -882,7 +1095,6 @@ def handle_message(message):
             send_message(chat_id, txt)
         return
 
-    # خرید
     if text.startswith("/buy "):
         item = text[5:].strip()
         result = buy_item(uid, chat_id, item)
@@ -896,15 +1108,12 @@ def handle_message(message):
         send_message(chat_id, "🎒 " + (", ".join(inv) if inv else "چیزی نخریدی."))
         return
 
-    # منو
     if text.lower() == MENU_COMMAND:
         send_message(chat_id, "🪿 منوی Goose:", get_main_menu()); return
 
-    # بازی
     if text in ("Goose بازی", "بازی"):
         send_message(chat_id, "🎮 بازی:", get_game_menu()); return
 
-    # امتحان/تکلیف
     if "امتحان" in text and ("goose" in text.lower() or "گوس" in text.lower()):
         send_exam_list(chat_id); return
     if "تکلیف" in text and ("goose" in text.lower() or "گوس" in text.lower()):
@@ -913,10 +1122,9 @@ def handle_message(message):
         achs = get_achievements(uid, chat_id)
         send_message(chat_id, "🏆 " + ("\n".join(achs) if achs else "هنوز نداری.")); return
 
-    # چک بازی
-    conn = get_conn(); c = conn.cursor()
-    c.execute("SELECT game_type, state FROM game_sessions WHERE chat_id=%s", (chat_id,))
-    gs = c.fetchone(); c.close(); conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT game_type, state FROM game_sessions WHERE chat_id=?", (chat_id,))
+    gs = c.fetchone(); conn.close()
     if gs and text:
         gt, st = gs
         if gt == "guess":
@@ -925,9 +1133,9 @@ def handle_message(message):
                 if n == int(st):
                     add_coins(uid, chat_id, 10)
                     send_message(chat_id, f"🎉 {first_name} درست گفت! +10 سکه")
-                    conn = get_conn(); c = conn.cursor()
-                    c.execute("DELETE FROM game_sessions WHERE chat_id=%s", (chat_id,))
-                    conn.commit(); c.close(); conn.close()
+                    conn = db(); c = conn.cursor()
+                    c.execute("DELETE FROM game_sessions WHERE chat_id=?", (chat_id,))
+                    conn.commit(); conn.close()
                     return
                 elif n < int(st):
                     send_message(chat_id, "⬆️ بالاتره"); return
@@ -938,12 +1146,11 @@ def handle_message(message):
             if st.lower() in text.lower():
                 add_coins(uid, chat_id, 10)
                 send_message(chat_id, f"🎉 {first_name} درست گفت! +10 سکه")
-                conn = get_conn(); c = conn.cursor()
-                c.execute("DELETE FROM game_sessions WHERE chat_id=%s", (chat_id,))
-                conn.commit(); c.close(); conn.close()
+                conn = db(); c = conn.cursor()
+                c.execute("DELETE FROM game_sessions WHERE chat_id=?", (chat_id,))
+                conn.commit(); conn.close()
                 return
 
-    # پاسخ‌های هوشمند
     if "سلام" in text:
         send_message(chat_id, mood_reply("سلام")); return
     if "خوبی" in text or "چطوری" in text:
@@ -951,14 +1158,13 @@ def handle_message(message):
     if "خداحافظ" in text or "بای" in text:
         send_message(chat_id, mood_reply("خداحافظ")); return
 
-    # صدا زدن Goose → سکه
     lower = text.lower()
     if "goose" in lower or "گوس" in lower:
         if uid:
             inc_field(uid, chat_id, "goose_calls")
             add_coins(uid, chat_id, 1)
             u = get_user(uid, chat_id)
-            calls = u.get("goose_calls", 1) if u else 1
+            calls = u[4] if u else 1
             send_message(chat_id, f"{goose_call_reply(calls)}\n💰 +1 سکه")
             for t in check_achievements(uid, chat_id):
                 send_message(chat_id, f"🏆 {first_name} دستاورد گرفت: {t}")
@@ -966,7 +1172,7 @@ def handle_message(message):
 # ================== حلقه ==================
 def bot_loop():
     global bot_active, last_update_id
-    print("🪿 Goose v4.0 started")
+    print("🪿 Goose v6.2 started")
     try:
         me = requests.get(f"{API_URL}/getMe", timeout=10).json()
         print(f"[getMe] {me}")
@@ -988,7 +1194,7 @@ def bot_loop():
 app = Flask(__name__)
 
 @app.route("/")
-def index(): return "Goose v4.0 (PostgreSQL) 🪿"
+def index(): return "Goose v6.2 🪿"
 
 @app.route("/health")
 def health(): return "OK"
